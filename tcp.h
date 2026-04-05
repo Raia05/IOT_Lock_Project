@@ -74,7 +74,7 @@ bool isTcpSyn(etherHeader *ether);
 bool isTcpAck(etherHeader *ether);
 
 void sendTcpPendingMessages(etherHeader *ether);
-void processDhcpResponse(etherHeader *ether);
+void processTcpResponse(etherHeader *ether);
 void processTcpArpResponse(etherHeader *ether);
 
 void setTcpPortList(uint16_t ports[], uint8_t count);
