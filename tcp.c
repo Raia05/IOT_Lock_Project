@@ -805,7 +805,10 @@ void processTcpResponse(etherHeader *ether)
             }
             else if (flags & RST)
             {
+                uint8_t i = getSocketIndex(s);
                 s->state = TCP_CLOSED;
+                clearTcpPendingState(i);
+                return;
             }
             break;
         }
@@ -823,8 +826,9 @@ void processTcpResponse(etherHeader *ether)
             if (flags & FIN)
             {
                 // In this minimal client stack, send FIN|ACK immediately
-                sendTcpResponse(ether, s, FIN | ACK);
-                s->state = TCP_LAST_ACK;
+                s->acknowledgementNumber = seq + 1;
+                sendTcpResponse(ether, s, ACK);
+                s->state = TCP_CLOSE_WAIT;
             }
 
             // Bare ACKs do not require action in this minimal implementation
