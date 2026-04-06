@@ -13,41 +13,67 @@
 //-----------------------------------------------------------------------------
 #include <stdio.h>
 #include <string.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include "arp.h"
 #include "tcp.h"
 #include "timer.h"
+
 // ------------------------------------------------------------------------------
 // Globals
 // ------------------------------------------------------------------------------
-#define MAX_TCP_PORTS   4
-#define MAX_TCP_SOCKETS 10
-#define TCP_WINDOW_SIZE 1460
 
-// socket table is defined in socket.c
+// Socket table comes from socket.c
 extern socket sockets[MAX_TCP_SOCKETS];
 
-// List of TCP ports this device will listen on
+// These are kept only because tcp.h already expects them.
+// In this client-only version they are mostly unused.
 uint16_t tcpPorts[MAX_TCP_PORTS];
-
-// Number of valid entries in tcpPorts[]
 uint8_t tcpPortCount = 0;
-
-// Simple TCP state array for opened ports
 uint8_t tcpState[MAX_TCP_PORTS];
+
+// Simple IP identification counter for outgoing IP packets
+static uint16_t tcpIpId = 1;
+
+// Per-socket flags used by the client-side connection flow
+static bool tcpArpPending[MAX_TCP_SOCKETS];
+static bool tcpSynPending[MAX_TCP_SOCKETS];
+static bool tcpTxPending[MAX_TCP_SOCKETS];
+static bool tcpFinPending[MAX_TCP_SOCKETS];
+
+// Per-socket pending transmit buffer
+static uint16_t tcpPendingTxSize[MAX_TCP_SOCKETS];
+static uint8_t tcpPendingTxData[MAX_TCP_SOCKETS][TCP_TX_BUFFER_SIZE];
 
 // ------------------------------------------------------------------------------
 // Local helpers
 // ------------------------------------------------------------------------------
 
 /*
- * Returns the TCP header length in BYTES.
- *
- * In TCP, the header length is stored in 32-bit words, not bytes.
- * So if the header length field says "5", that means:
- * 5 words * 4 bytes/word = 20 bytes.
- *
- * This matters because the TCP payload starts AFTER the TCP header.
- * If this length is wrong, payload parsing will be wrong.
+ * Returns the socket index from a socket pointer.
+ * This works because sockets[] is a contiguous array in memory.
+ */
+static uint8_t getSocketIndex(socket *s)
+{
+    return (uint8_t)(s - sockets);
+}
+
+/*
+ * Clears all client-side pending flags and pending TX buffer info
+ * for one socket index.
+ */
+static void clearTcpPendingState(uint8_t i)
+{
+    tcpArpPending[i] = false;
+    tcpSynPending[i] = false;
+    tcpTxPending[i] = false;
+    tcpFinPending[i] = false;
+    tcpPendingTxSize[i] = 0;
+}
+
+/*
+ * Returns TCP header length in bytes.
+ * TCP stores header length in 32-bit words, so multiply by 4.
  */
 static uint8_t getTcpHeaderLengthBytes(tcpHeader *tcp)
 {
@@ -55,12 +81,7 @@ static uint8_t getTcpHeaderLengthBytes(tcpHeader *tcp)
 }
 
 /*
- * Extracts the TCP flags field.
- *
- * The lower bits of offsetFields contain flags such as:
- * SYN, ACK, FIN, RST, PSH
- *
- * We mask with 0x01FF to keep only the 9 TCP flag bits.
+ * Returns the 9-bit TCP flags field (SYN, ACK, FIN, etc).
  */
 static uint16_t getTcpFlags(tcpHeader *tcp)
 {
@@ -68,49 +89,31 @@ static uint16_t getTcpFlags(tcpHeader *tcp)
 }
 
 /*
- * Returns total TCP segment length = TCP header + TCP payload.
- *
- * IP total length includes:
- *   IP header + TCP header + TCP payload
- *
- * So:
- *   TCP segment length = IP total length - IP header length
- *
- * This value is useful for checksum and validation.
+ * Returns total TCP segment length = TCP header + payload.
+ * IP total length includes IP header + TCP segment,
+ * so subtract the IP header length.
  */
 static uint16_t getTcpSegmentLength(etherHeader *ether)
 {
     ipHeader *ip = (ipHeader*)ether->data;
     uint16_t ipLength = ntohs(ip->length);
     uint16_t ipHeaderLength = ip->size * 4;
-
     return ipLength - ipHeaderLength;
 }
 
 /*
- * Returns only the TCP payload length (no TCP header).
- *
- * This is:
- *   payload = total TCP segment length - TCP header length
- *
- * We need payload length to:
- * 1. know if data was received
- * 2. update ACK number correctly
- *
- * If payload length is wrong, the receiver and sender get out of sync.
+ * Returns only the TCP payload length.
+ * payload = total TCP segment length - TCP header length
  */
 static uint16_t getTcpPayloadLength(etherHeader *ether)
 {
     ipHeader *ip = (ipHeader*)ether->data;
     uint8_t ipHeaderLength = ip->size * 4;
-
     tcpHeader *tcp = (tcpHeader*)((uint8_t*)ip + ipHeaderLength);
 
     uint16_t tcpSegmentLength = ntohs(ip->length) - ipHeaderLength;
     uint16_t tcpHeaderLength = getTcpHeaderLengthBytes(tcp);
 
-    // If header length is bigger than the TCP segment itself,
-    // this is invalid, so return 0.
     if (tcpSegmentLength < tcpHeaderLength)
         return 0;
 
@@ -118,18 +121,13 @@ static uint16_t getTcpPayloadLength(etherHeader *ether)
 }
 
 /*
- * Returns a pointer to the start of TCP payload data.
- *
- * This is the first byte AFTER the TCP header.
- *
- * Later this will be useful for application protocols like MQTT,
- * since MQTT data is carried inside the TCP payload.
+ * Returns pointer to TCP payload data.
+ * This is the first byte after the TCP header.
  */
 static uint8_t *getTcpPayload(etherHeader *ether)
 {
     ipHeader *ip = (ipHeader*)ether->data;
     uint8_t ipHeaderLength = ip->size * 4;
-
     tcpHeader *tcp = (tcpHeader*)((uint8_t*)ip + ipHeaderLength);
     uint8_t tcpHeaderLength = getTcpHeaderLengthBytes(tcp);
 
@@ -137,14 +135,8 @@ static uint8_t *getTcpPayload(etherHeader *ether)
 }
 
 /*
- * Returns how much TCP sequence space this packet consumes.
- *
- * TCP sequence numbers advance by:
- * - 1 for SYN
- * - 1 for FIN
- * - N for N bytes of payload
- *
- * This helper is useful when figuring out how far to advance ACK.
+ * Returns how much sequence space a received segment consumes.
+ * SYN counts as 1, FIN counts as 1, payload counts as payloadLength.
  */
 static uint32_t tcpControlLength(tcpHeader *tcp, uint16_t payloadLength)
 {
@@ -158,51 +150,36 @@ static uint32_t tcpControlLength(tcpHeader *tcp, uint16_t payloadLength)
 }
 
 /*
- * Adds the TCP pseudo-header into the checksum sum.
- *
- * TCP checksum includes more than just the TCP bytes.
- * It also includes:
+ * Adds the TCP pseudo-header fields into the checksum sum.
+ * TCP checksum includes:
  * - source IP
  * - destination IP
  * - protocol
  * - TCP length
- *
- * This is required by the TCP standard.
  */
 static void sumTcpPseudoHeader(ipHeader *ip, uint16_t tcpLength, uint32_t *sum)
 {
     sumIpWords(ip->sourceIp, 4, sum);
     sumIpWords(ip->destIp, 4, sum);
 
-    // Reserved byte + protocol byte
     *sum += 0;
     *sum += PROTOCOL_TCP << 8;
 
-    // TCP length added as two bytes
     *sum += (tcpLength & 0x00FF) << 8;
     *sum += (tcpLength & 0xFF00) >> 8;
 }
 
 /*
- * Calculates TCP checksum for a packet.
- *
- * Steps:
- * 1. Clear the checksum field
- * 2. Sum the pseudo-header
- * 3. Sum the TCP header and payload
- * 4. Return final 16-bit checksum
- *
- * This is used both when:
- * - verifying received packets
- * - creating packets to send
+ * Calculates TCP checksum over:
+ * - pseudo-header
+ * - TCP header
+ * - TCP payload
  */
 static uint16_t calcTcpChecksum(ipHeader *ip, tcpHeader *tcp, uint16_t tcpLength)
 {
     uint32_t sum = 0;
 
-    // Checksum field must be zero while calculating
     tcp->checksum = 0;
-
     sumTcpPseudoHeader(ip, tcpLength, &sum);
     sumIpWords(tcp, tcpLength, &sum);
 
@@ -210,48 +187,28 @@ static uint16_t calcTcpChecksum(ipHeader *ip, tcpHeader *tcp, uint16_t tcpLength
 }
 
 /*
- * Compares two IP addresses.
- *
- * Returns true if they are exactly the same.
- * Used to match incoming packets to an existing socket.
+ * Returns true if two IP addresses match.
  */
 static bool isIpAddressMatch(const uint8_t a[4], const uint8_t b[4])
 {
-    return memcmp(a, b, 4) == 0;
+    return (memcmp(a, b, 4) == 0);
 }
 
 /*
- * Compares two MAC addresses.
+ * Finds a socket that matches the incoming packet's connection tuple:
+ * local port, remote port, remote IP.
  *
- * Returns true if they are exactly the same.
- * Included as a helper for hardware-layer matching.
- */
-static bool isHwAddressMatch(const uint8_t a[6], const uint8_t b[6])
-{
-    return memcmp(a, b, 6) == 0;
-}
-
-/*
- * Finds an existing socket that matches this incoming TCP packet.
- *
- * A TCP connection is identified by:
- * - local port
- * - remote port
- * - remote IP
- *
- * If a matching active socket is found, return pointer to it.
- * Otherwise return NULL.
+ * Since this is client-side only, we only care about packets that belong
+ * to a connection we previously started.
  */
 static socket *findSocketByTuple(etherHeader *ether)
 {
     ipHeader *ip = (ipHeader*)ether->data;
     uint8_t ipHeaderLength = ip->size * 4;
-
     tcpHeader *tcp = (tcpHeader*)((uint8_t*)ip + ipHeaderLength);
 
     uint16_t srcPort = ntohs(tcp->sourcePort);
     uint16_t dstPort = ntohs(tcp->destPort);
-
     uint8_t i;
 
     for (i = 0; i < MAX_TCP_SOCKETS; i++)
@@ -268,62 +225,98 @@ static socket *findSocketByTuple(etherHeader *ether)
     return NULL;
 }
 
-/*
- * Finds a listening socket that matches the destination port
- * of an incoming TCP packet.
- *
- * This is used when a SYN arrives for a port that the device
- * is listening on.
- */
-static socket *findListeningSocket(etherHeader *ether)
-{
-    ipHeader *ip = (ipHeader*)ether->data;
-    uint8_t ipHeaderLength = ip->size * 4;
-
-    tcpHeader *tcp = (tcpHeader*)((uint8_t*)ip + ipHeaderLength);
-
-    uint16_t dstPort = ntohs(tcp->destPort);
-
-    uint8_t i;
-
-    for (i = 0; i < MAX_TCP_SOCKETS; i++)
-    {
-        if (sockets[i].state == TCP_LISTEN &&
-            sockets[i].localPort == dstPort)
-        {
-            return &sockets[i];
-        }
-    }
-
-    return NULL;
-}
+// ------------------------------------------------------------------------------
+// Public client helpers
+// ------------------------------------------------------------------------------
 
 /*
- * Allocates a new socket for an incoming TCP connection.
+ * Creates a client TCP socket and starts the ARP -> SYN connect sequence.
  *
- * This is typically called when a SYN arrives on an open port.
+ * This function is not declared in tcp.h on purpose since you asked to avoid
+ * changing the header. Later in mqtt.c you can declare it with:
  *
- * The new socket is filled in with:
- * - remote IP
- * - remote port
- * - remote MAC
- * - local port
- *
- * based on the incoming packet.
+ * extern socket* tcpConnect(uint8_t remoteIp[4], uint16_t remotePort, uint16_t localPort);
  */
-static socket *allocateSocketFromIncomingTcp(etherHeader *ether)
+socket* tcpConnect(uint8_t remoteIp[4], uint16_t remotePort, uint16_t localPort)
 {
     socket *s = newSocket();
+    uint8_t i;
 
-    if (s != NULL)
-    {
-        memset(s, 0, sizeof(socket));
-        getSocketInfoFromTcpPacket(ether, s);
-    }
+    if (s == NULL)
+        return NULL;
+
+    memset(s, 0, sizeof(socket));
+
+    memcpy(s->remoteIpAddress, remoteIp, 4);
+    s->remotePort = remotePort;
+    s->localPort = localPort;
+    s->sequenceNumber = random32();       // initial local sequence number
+    s->acknowledgementNumber = 0;
+    s->state = TCP_CLOSED;
+
+    i = getSocketIndex(s);
+    clearTcpPendingState(i);
+
+    // First we need remote MAC address, so start with ARP
+    tcpArpPending[i] = true;
 
     return s;
 }
 
+/*
+ * Returns true if socket is connected and fully established.
+ */
+bool tcpIsConnected(socket *s)
+{
+    if (s == NULL)
+        return false;
+
+    return (s->state == TCP_ESTABLISHED);
+}
+
+/*
+ * Queues application data for transmit.
+ * Data will be sent later by sendTcpPendingMessages().
+ */
+bool tcpSend(socket *s, uint8_t data[], uint16_t dataSize)
+{
+    uint8_t i;
+
+    if (s == NULL || data == NULL)
+        return false;
+
+    if (s->state != TCP_ESTABLISHED)
+        return false;
+
+    if (dataSize > TCP_TX_BUFFER_SIZE)
+        return false;
+
+    i = getSocketIndex(s);
+
+    memcpy(tcpPendingTxData[i], data, dataSize);
+    tcpPendingTxSize[i] = dataSize;
+    tcpTxPending[i] = true;
+
+    return true;
+}
+
+/*
+ * Requests graceful TCP close.
+ * Actual FIN will be sent by sendTcpPendingMessages().
+ */
+void tcpClose(socket *s)
+{
+    uint8_t i;
+
+    if (s == NULL)
+        return;
+
+    if (s->state == TCP_ESTABLISHED)
+    {
+        i = getSocketIndex(s);
+        tcpFinPending[i] = true;
+    }
+}
 
 // ------------------------------------------------------------------------------
 // State access
@@ -650,34 +643,89 @@ void sendTcpMessage(etherHeader *ether, socket *s, uint16_t flags, uint8_t data[
 // ------------------------------------------------------------------------------
 
 /*
- * Placeholder for future queued TCP transmissions.
+ * Drives client-side TCP actions from the main loop.
  *
- * Right now the repo does not yet have a TCP send queue
- * or active-open request queue.
- *
- * Later this function can be used for:
- * - initiating outgoing TCP client connections
- * - sending queued payload data
- * - retransmissions
+ * Per socket:
+ * 1. If ARP is pending, send ARP request for remote IP
+ * 2. If SYN is pending, send SYN and enter SYN_SENT
+ * 3. If data is pending and connection is ESTABLISHED, send PSH|ACK
+ * 4. If close is pending, send FIN|ACK and enter FIN_WAIT_1
  */
 void sendTcpPendingMessages(etherHeader *ether)
 {
-    (void)ether;
+    uint8_t i;
+    uint8_t localIp[4];
+
+    getIpAddress(localIp);
+
+    for (i = 0; i < MAX_TCP_SOCKETS; i++)
+    {
+        // 1) Need remote MAC first
+        if (tcpArpPending[i] && sockets[i].state == TCP_CLOSED)
+        {
+            tcpArpPending[i] = false;
+            sendArpRequest(ether, localIp, sockets[i].remoteIpAddress);
+        }
+
+        // 2) Ready to start TCP handshake
+        else if (tcpSynPending[i] && sockets[i].state == TCP_CLOSED)
+        {
+            tcpSynPending[i] = false;
+            sockets[i].state = TCP_SYN_SENT;
+            sendTcpMessage(ether, &sockets[i], SYN, NULL, 0);
+        }
+
+        // 3) Send pending application data
+        else if (tcpTxPending[i] && sockets[i].state == TCP_ESTABLISHED)
+        {
+            tcpTxPending[i] = false;
+            sendTcpMessage(ether, &sockets[i], ACK | PSH,
+                           tcpPendingTxData[i], tcpPendingTxSize[i]);
+            tcpPendingTxSize[i] = 0;
+        }
+
+        // 4) Graceful close
+        else if (tcpFinPending[i] && sockets[i].state == TCP_ESTABLISHED)
+        {
+            tcpFinPending[i] = false;
+            sendTcpResponse(ether, &sockets[i], FIN | ACK);
+            sockets[i].state = TCP_FIN_WAIT_1;
+        }
+    }
 }
+
 
 // ------------------------------------------------------------------------------
 // ARP callback hook
 // ------------------------------------------------------------------------------
 
 /*
- * Placeholder for future TCP behavior tied to ARP resolution.
+ * Called when an ARP response comes in.
  *
- * For example, if later you add active TCP connect for MQTT,
- * this function can be used to react once ARP learns the broker MAC.
+ * If the ARP response matches the remote IP of one of our sockets,
+ * copy the remote MAC address into the socket and mark SYN pending.
+ *
+ * This allows the next pass through sendTcpPendingMessages() to send SYN.
  */
 void processTcpArpResponse(etherHeader *ether)
 {
-    (void)ether;
+    uint8_t i;
+    arpPacket *arp;
+
+    if (!isArpResponse(ether))
+        return;
+
+    arp = (arpPacket*)ether->data;
+
+    for (i = 0; i < MAX_TCP_SOCKETS; i++)
+    {
+        if (sockets[i].state == TCP_CLOSED &&
+            isIpAddressMatch(sockets[i].remoteIpAddress, arp->sourceIp))
+        {
+            memcpy(sockets[i].remoteHwAddress, arp->sourceAddress, 6);
+            tcpSynPending[i] = true;
+        }
+    }
 }
 
 // ------------------------------------------------------------------------------
@@ -685,16 +733,18 @@ void processTcpArpResponse(etherHeader *ether)
 // ------------------------------------------------------------------------------
 
 /*
- * Main TCP state machine.
+ * Main client-side TCP state machine.
  *
- * This function processes every valid incoming TCP packet and decides:
- * - is it for an existing socket?
- * - is it a new SYN for an open listening port?
- * - does it complete a handshake?
- * - does it carry payload that needs ACK?
- * - is it closing the connection?
+ * Only handles packets belonging to sockets that WE opened.
  *
- * This is the core of TCP behavior in the file.
+ * States handled:
+ * - TCP_SYN_SENT
+ * - TCP_ESTABLISHED
+ * - TCP_FIN_WAIT_1
+ * - TCP_FIN_WAIT_2
+ * - TCP_CLOSE_WAIT
+ * - TCP_LAST_ACK
+ * - TCP_TIME_WAIT
  */
 void processTcpResponse(etherHeader *ether)
 {
@@ -706,138 +756,84 @@ void processTcpResponse(etherHeader *ether)
     uint16_t payloadLength;
     uint32_t seq;
     uint32_t ack;
+    uint32_t segLen;
 
-    // Ignore anything that is not valid TCP
     if (!isTcp(ether))
         return;
 
-    // Locate IP and TCP headers
     ip = (ipHeader*)ether->data;
     ipHeaderLength = ip->size * 4;
     tcp = (tcpHeader*)((uint8_t*)ip + ipHeaderLength);
 
-    // Extract useful packet fields
     flags = getTcpFlags(tcp);
     payloadLength = getTcpPayloadLength(ether);
     seq = ntohl(tcp->sequenceNumber);
     ack = ntohl(tcp->acknowledgementNumber);
+    segLen = tcpControlLength(tcp, payloadLength);
 
-    // First, try to find an existing socket that matches this connection
+    // Only process packets that match a client socket we already created
     s = findSocketByTuple(ether);
-
-    // If no existing socket is found, check if this is a new SYN
-    // for one of our open listening ports
-    if (s == NULL && (flags & SYN) && isTcpPortOpen(ether))
-    {
-        socket *listenSock = findListeningSocket(ether);
-        if (listenSock != NULL)
-        {
-            s = allocateSocketFromIncomingTcp(ether);
-            if (s != NULL)
-            {
-                // Move new socket into SYN_RECEIVED state
-                s->state = TCP_SYN_RECEIVED;
-
-                // Choose a simple local initial sequence number
-                s->sequenceNumber = 0x1000;
-
-                // ACK should expect the next byte after SYN
-                s->acknowledgementNumber = seq + 1;
-
-                // Reply with SYN+ACK
-                sendTcpResponse(ether, s, SYN | ACK);
-            }
-        }
-        return;
-    }
-
-    // If no valid socket exists, ignore this packet
     if (s == NULL)
         return;
 
-    // Process packet based on socket state
     switch (s->state)
     {
-        case TCP_LISTEN:
+        case TCP_CLOSED:
         {
-            // In LISTEN, wait for SYN
-            if (flags & SYN)
-            {
-                s->state = TCP_SYN_RECEIVED;
-                s->sequenceNumber = 0x1000;
-                s->acknowledgementNumber = seq + 1;
-
-                // Reply with SYN+ACK
-                sendTcpResponse(ether, s, SYN | ACK);
-            }
-            break;
-        }
-
-        case TCP_SYN_RECEIVED:
-        {
-            // Waiting for final ACK of handshake
-            if ((flags & ACK) && ack == s->sequenceNumber)
-            {
-                s->state = TCP_ESTABLISHED;
-            }
+            // We do nothing here.
+            // Active open starts from sendTcpPendingMessages().
             break;
         }
 
         case TCP_SYN_SENT:
         {
-            // Client-side state:
-            // we already sent SYN and are waiting for SYN+ACK
+            // Expecting SYN+ACK from the broker
             if ((flags & SYN) && (flags & ACK))
             {
-                s->acknowledgementNumber = seq + 1;
+                // ACK number from peer should acknowledge our SYN
+                if (ack == s->sequenceNumber)
+                {
+                    // Expect the next byte after peer's SYN
+                    s->acknowledgementNumber = seq + 1;
 
-                // Send final ACK of handshake
-                sendTcpResponse(ether, s, ACK);
+                    // Send final ACK of the 3-way handshake
+                    sendTcpResponse(ether, s, ACK);
 
-                s->state = TCP_ESTABLISHED;
+                    // Connection is now open
+                    s->state = TCP_ESTABLISHED;
+                }
             }
-            break;
-        }
-
-        case TCP_ESTABLISHED:
-        {
-            uint32_t segLen = tcpControlLength(tcp, payloadLength);
-
-            if (segLen > 0)
-            {
-                s->acknowledgementNumber = seq + segLen;
-                sendTcpResponse(ether, s, ACK);
-            }
-
-            if (flags & FIN)
-                s->state = TCP_CLOSE_WAIT;
-
-            break;
-        }
-
-        case TCP_CLOSE_WAIT:
-        {
-            // Passive close:
-            // peer already sent FIN, and we ACKed it.
-            // Now send our own FIN+ACK to finish closing.
-            sendTcpResponse(ether, s, FIN | ACK);
-            s->state = TCP_LAST_ACK;
-            break;
-        }
-
-        case TCP_LAST_ACK:
-        {
-            // Waiting for final ACK of our FIN
-            if (flags & ACK)
+            else if (flags & RST)
             {
                 s->state = TCP_CLOSED;
             }
             break;
         }
 
+        case TCP_ESTABLISHED:
+        {
+            // If data and/or FIN arrived, acknowledge everything consumed
+            if (segLen > 0)
+            {
+                s->acknowledgementNumber = seq + segLen;
+                sendTcpResponse(ether, s, ACK);
+            }
+
+            // If broker closes first, move into passive-close path
+            if (flags & FIN)
+            {
+                // In this minimal client stack, send FIN|ACK immediately
+                sendTcpResponse(ether, s, FIN | ACK);
+                s->state = TCP_LAST_ACK;
+            }
+
+            // Bare ACKs do not require action in this minimal implementation
+            break;
+        }
+
         case TCP_FIN_WAIT_1:
         {
-            // We initiated close and already sent FIN
+            // Waiting for ACK of our FIN, and possibly peer FIN
 
             if (flags & ACK)
                 s->state = TCP_FIN_WAIT_2;
@@ -848,6 +844,7 @@ void processTcpResponse(etherHeader *ether)
                 sendTcpResponse(ether, s, ACK);
                 s->state = TCP_TIME_WAIT;
             }
+
             break;
         }
 
@@ -863,11 +860,34 @@ void processTcpResponse(etherHeader *ether)
             break;
         }
 
+        case TCP_CLOSE_WAIT:
+        {
+            // Not normally used in this client-only simplified path
+            sendTcpResponse(ether, s, FIN | ACK);
+            s->state = TCP_LAST_ACK;
+            break;
+        }
+
+        case TCP_LAST_ACK:
+        {
+            // Waiting for peer to ACK our FIN
+            if (flags & ACK)
+            {
+                uint8_t i = getSocketIndex(s);
+                s->state = TCP_CLOSED;
+                clearTcpPendingState(i);
+            }
+            break;
+        }
+
         case TCP_TIME_WAIT:
         {
-            // Minimal implementation:
-            // close immediately instead of waiting 2*MSL
-            s->state = TCP_CLOSED;
+            // Minimal simplification: immediately close
+            {
+                uint8_t i = getSocketIndex(s);
+                s->state = TCP_CLOSED;
+                clearTcpPendingState(i);
+            }
             break;
         }
 
