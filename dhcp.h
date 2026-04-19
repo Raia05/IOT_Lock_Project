@@ -48,6 +48,17 @@ typedef struct _dhcpFrame // 240 or more bytes
   uint8_t options[0];
 } dhcpFrame;
 
+#define DHCP_DISABLED   0
+#define DHCP_INIT       1
+#define DHCP_SELECTING  2
+#define DHCP_REQUESTING 3
+#define DHCP_TESTING_IP 4
+#define DHCP_BOUND      5
+#define DHCP_RENEWING   6
+#define DHCP_REBINDING  7
+#define DHCP_INITREBOOT 8
+#define DHCP_REBOOTING  9
+
 //-----------------------------------------------------------------------------
 // Subroutines
 //-----------------------------------------------------------------------------
@@ -66,6 +77,8 @@ void renewDhcp(void);
 void releaseDhcp(void);
 
 uint32_t getDhcpLeaseSeconds();
+
+uint8_t getDhcpState(void);
 
 #endif
 

@@ -34,5 +34,7 @@ void subscribeMqtt(char strTopic[]);
 void unsubscribeMqtt(char strTopic[]);
 void processMqttMessage(uint8_t data[], uint16_t length);
 
+void processMqttConnection();
+
 #endif
 

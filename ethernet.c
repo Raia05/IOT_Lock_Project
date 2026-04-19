@@ -472,6 +472,7 @@ void processShell()
 // Max packet is calculated as:
 // Ether frame header (18) + Max MTU (1500)
 #define MAX_PACKET_SIZE 1518
+static bool mqttStarted = false;
 
 int main(void)
 {
@@ -524,6 +525,13 @@ int main(void)
         // TCP pending messages
         sendTcpPendingMessages(data);
 
+        processMqttConnection();
+        if (!mqttStarted && getDhcpState() == DHCP_BOUND)
+        {
+            connectMqtt();
+            mqttStarted = true;
+        }
+
         // Packet processing
         if (isEtherDataAvailable())
         {
@@ -553,8 +561,8 @@ int main(void)
             // Handle IP datagram
             if (isIp(data))
             {
-            	if (isIpUnicast(data))
-            	{
+                if (isIpUnicast(data))
+                {
                     // Handle ICMP ping request
                     if (isPingRequest(data))
                     {
@@ -564,14 +572,10 @@ int main(void)
                     // Handle TCP datagram
                     if (isTcp(data))
                     {
-                        if (isTcpPortOpen(data))
-                        {
-                        }
-                        else
-                            sendTcpResponse(data, &s, ACK | RST);
+                        processTcpResponse(data);
                     }
                 }
-            	// Handle DHCP response
+                // Handle DHCP response
                 if (isUdp(data))
                 {
                     if (isDhcpResponse(data))
@@ -589,4 +593,3 @@ int main(void)
         }
     }
 }
-

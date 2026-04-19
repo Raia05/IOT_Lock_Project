@@ -65,6 +65,8 @@ uint8_t dhcpServerIpAdd[4];
 uint8_t dhcpState = DHCP_INIT;
 bool    dhcpEnabled = true;
 
+static bool dhcpConflictProbeSent = false;
+
 //added flags
 bool requestSent = false;
 bool gratuitousArpNeeded = false;
@@ -152,7 +154,7 @@ void callbackDhcpT1HitTimer()
     {
         stopTimer(callbackDhcpT1PeriodicTimer);
         uint32_t t2Offset = leaseT2 - leaseT1;
-        callbackDhcpLeaseEndTimer(callbackDhcpT2HitTimer);
+        restartTimer(callbackDhcpT2HitTimer);
         startOneshotTimer(callbackDhcpT2HitTimer, t2Offset);
 
         dhcpState = DHCP_RENEWING;
@@ -229,6 +231,7 @@ void callbackDhcpRequestRetryTimer()
 void callbackDhcpIpConflictWindow()
 {
     ipConflictDetectionMode = false;
+    dhcpConflictProbeSent = false;
 
     if (dhcpState == DHCP_TESTING_IP)
     {
@@ -243,6 +246,7 @@ void callbackDhcpIpConflictWindow()
 void requestDhcpIpConflictTest()
 {
     ipConflictDetectionMode = true;
+    dhcpConflictProbeSent = false;
     restartTimer(callbackDhcpIpConflictWindow);
     startOneshotTimer(callbackDhcpIpConflictWindow, 2);
 }
@@ -698,7 +702,11 @@ void sendDhcpPendingMessages(etherHeader *ether)
 
     else if (dhcpState == DHCP_TESTING_IP)
     {
-        sendArpRequest(ether, zeroIp, dhcpOfferedIpAdd);
+        if (ipConflictDetectionMode && !dhcpConflictProbeSent)
+        {
+            sendArpRequest(ether, zeroIp, dhcpOfferedIpAdd);
+            dhcpConflictProbeSent = true;
+        }
     }
     else if (dhcpState == DHCP_BOUND)
     {
@@ -842,33 +850,15 @@ void processDhcpResponse(etherHeader *ether)
 
 void processDhcpArpResponse(etherHeader *ether)
 {
-    // Check if we're in IP conflict detection mode
-    if (ipConflictDetectionMode && dhcpState == DHCP_TESTING_IP)
+    if (dhcpState == DHCP_TESTING_IP && ipConflictDetectionMode && isArpResponse(ether))
     {
-        arpPacket *arp = (arpPacket*)ether->data;
-        uint8_t i;
-        bool isConflict = true;
+        stopTimer(callbackDhcpIpConflictWindow);
+        ipConflictDetectionMode = false;
 
-        for (i = 0; i < IP_ADD_LENGTH; i++)
-        {
-            if (arp->sourceIp[i] != dhcpOfferedIpAdd[i])
-            {
-                isConflict = false;
-                break;
-            }
-        }
+        sendDhcpMessage(ether, DHCPDECLINE);
+        dhcpState = DHCP_INIT;
 
-        if (isConflict)
-        {
-
-            stopTimer(callbackDhcpIpConflictWindow);
-            ipConflictDetectionMode = false;
-
-
-            sendDhcpMessage(ether, DHCPDECLINE);
-
-            dhcpState = DHCP_INIT;
-        }
+        xid = 0;
     }
 }
 
