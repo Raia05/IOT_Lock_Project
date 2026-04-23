@@ -51,8 +51,8 @@ static uint16_t tcpPendingTxSize[MAX_TCP_SOCKETS];
 static uint8_t tcpPendingTxData[MAX_TCP_SOCKETS][TCP_TX_BUFFER_SIZE];
 
 // one-shot connect test
-static bool tcpTestStarted = false;
-static socket *tcpTestSocket = 0;
+//static bool tcpTestStarted = false;
+//static socket *tcpTestSocket = 0;
 
 // ------------------------------------------------------------------------------
 // Local helpers
@@ -82,13 +82,6 @@ static uint16_t getTcpFlags(tcpHeader *tcp)
     return (uint16_t)(ntohs(tcp->offsetFields) & 0x01FF);
 }
 
-static uint16_t getTcpSegmentLength(etherHeader *ether)
-{
-    ipHeader *ip = (ipHeader*)ether->data;
-    uint16_t ipLength = ntohs(ip->length);
-    uint16_t ipHeaderLength = ip->size * 4;
-    return ipLength - ipHeaderLength;
-}
 
 static uint16_t getTcpPayloadLength(etherHeader *ether)
 {
@@ -102,15 +95,6 @@ static uint16_t getTcpPayloadLength(etherHeader *ether)
         return 0;
 
     return tcpSegmentLength - tcpHeaderLength;
-}
-
-static uint8_t *getTcpPayload(etherHeader *ether)
-{
-    ipHeader *ip = (ipHeader*)ether->data;
-    uint8_t ipHeaderLength = ip->size * 4;
-    tcpHeader *tcp = (tcpHeader*)((uint8_t*)ip + ipHeaderLength);
-    uint8_t tcpHeaderLength = getTcpHeaderLengthBytes(tcp);
-    return ((uint8_t*)tcp + tcpHeaderLength);
 }
 
 static uint32_t tcpControlLength(tcpHeader *tcp, uint16_t payloadLength)
@@ -143,10 +127,6 @@ static uint16_t calcTcpChecksum(ipHeader *ip, tcpHeader *tcp, uint16_t tcpLength
     return getIpChecksum(sum);
 }
 
-static bool isIpAddressMatch(const uint8_t a[4], const uint8_t b[4])
-{
-    return (memcmp(a, b, 4) == 0);
-}
 
 static socket *findSocketByTuple(etherHeader *ether)
 {
@@ -205,19 +185,6 @@ socket* tcpConnect(uint8_t remoteIp[4], uint16_t remotePort, uint16_t localPort)
     putsUart0("tcpConnect: socket created\r\n");
 
     return s;
-}
-
-static void startTcpConnectTest(void)
-{
-    uint8_t remoteIp[4] = {192, 168, 1, 51};   // CHANGE THIS TO YOUR LAPTOP OR SERVER IP
-
-    if (!tcpTestStarted && getDhcpState() == DHCP_BOUND)
-    {
-        tcpTestSocket = tcpConnect(remoteIp, 1883, 50000);  // CHANGE 1883 IF NEEDED
-        tcpTestStarted = true;
-
-        putsUart0("TCP test started\r\n");
-    }
 }
 
 bool tcpIsConnected(socket *s)
@@ -484,7 +451,6 @@ void sendTcpPendingMessages(etherHeader *ether)
             sendTcpMessage(ether, s, FIN | ACK, NULL, 0);
             s->sequenceNumber++;
             s->state = TCP_FIN_WAIT_1;
-            putsUart0("TCP_FIN_WAIT_1\r\n");
             tcpFinPending[i] = false;
         }
     }
@@ -575,24 +541,29 @@ void processTcpResponse(etherHeader *ether)
             s->acknowledgementNumber = remoteSeq + 1;
             sendTcpMessage(ether, s, ACK, NULL, 0);
             s->state = TCP_CLOSE_WAIT;
-            putsUart0("TCP_CLOSE_WAIT\r\n");
+            putsUart0("TCP CLOSE_WAIT\r\n");
         }
         return;
     }
 
     if (s->state == TCP_FIN_WAIT_1)
     {
-        if (flags & ACK)
+        if ((flags & ACK) && !(flags & FIN))
+        {
             s->state = TCP_FIN_WAIT_2;
-        putsUart0("TCP_FIN_WAIT_2\r\n");
+            putsUart0("TCP FIN_WAIT_2\r\n");
+            return;
+        }
 
         if (flags & FIN)
         {
             s->acknowledgementNumber = remoteSeq + 1;
             sendTcpMessage(ether, s, ACK, NULL, 0);
             s->state = TCP_TIME_WAIT;
-            putsUart0("TCP_TIME_WAIT\r\n");
+            putsUart0("TCP TIME_WAIT\r\n");
+            return;
         }
+
         return;
     }
 
@@ -603,8 +574,20 @@ void processTcpResponse(etherHeader *ether)
             s->acknowledgementNumber = remoteSeq + 1;
             sendTcpMessage(ether, s, ACK, NULL, 0);
             s->state = TCP_TIME_WAIT;
-            putsUart0("TCP_TIME_WAIT from FinWait2\r\n");
+            putsUart0("TCP TIME_WAIT\r\n");
         }
+        return;
+    }
+
+    if (s->state == TCP_CLOSE_WAIT)
+    {
+        return;
+    }
+
+    if (s->state == TCP_TIME_WAIT)
+    {
+        s->state = TCP_CLOSED;
+        putsUart0("TCP CLOSED\r\n");
         return;
     }
 }

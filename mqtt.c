@@ -7,8 +7,9 @@
 #include <stdbool.h>
 #include "mqtt.h"
 #include "tcp.h"
-#include "timer.h"
+#include "ip.h"
 #include "uart0.h"
+#include "timer.h"
 
 // ------------------------------------------------------------------------------
 // Globals
@@ -19,10 +20,8 @@ static bool mqttConnectRequested = false;
 static bool mqttConnectSent = false;
 static bool mqttConnected = false;
 
-static uint8_t mqttBrokerIp[4] = {192, 168, 1, 51};   // CHANGE THIS IF NEEDED
 static uint16_t mqttBrokerPort = 1883;
-static uint16_t mqttLocalPort = 50000;
-
+static uint16_t mqttLocalPort = 50001;
 static char mqttClientId[] = "tm4cClient";
 
 // ------------------------------------------------------------------------------
@@ -98,9 +97,9 @@ static bool mqttSendConnectPacket(void)
     packet[i++] = 'T';
     packet[i++] = 'T';
     packet[i++] = 0x04;   // MQTT 3.1.1
-    packet[i++] = 0x02;   // Clean session
-    packet[i++] = 0x00;   // Keep alive MSB
-    packet[i++] = 0x3C;   // Keep alive LSB = 60
+    packet[i++] = 0x02;   // Clean Session
+    packet[i++] = 0x00;   // Keepalive MSB
+    packet[i++] = 0x3C;   // Keepalive LSB = 60
 
     // Payload
     i = mqttAddString(packet, i, mqttClientId);
@@ -108,20 +107,141 @@ static bool mqttSendConnectPacket(void)
     return tcpSend(mqttSocket, packet, i);
 }
 
+void processMqttResponse(etherHeader *ether)
+{
+    ipHeader *ip;
+    tcpHeader *tcp;
+    uint8_t ipHeaderLength;
+    uint8_t tcpHeaderLength;
+    uint16_t ipTotalLength;
+    uint16_t tcpSegmentLength;
+    uint16_t payloadLength;
+    uint8_t *payload;
+    uint8_t packetType;
+    uint8_t returnCode;
+    uint16_t topicLength;
+    uint16_t topicIndex;
+    uint16_t dataIndex;
+    uint16_t dataLength;
+    char topic[64];
+    char msg[128];
+    uint16_t i;
+
+    if (mqttSocket == 0)
+        return;
+
+    if (!isTcp(ether))
+        return;
+
+    if (!tcpIsConnected(mqttSocket))
+        return;
+
+    ip = (ipHeader*) ether->data;
+    ipHeaderLength = ip->size * 4;
+    tcp = (tcpHeader*) ((uint8_t*) ip + ipHeaderLength);
+    tcpHeaderLength = (ntohs(tcp->offsetFields) >> OFS_SHIFT) * 4;
+
+    ipTotalLength = ntohs(ip->length);
+    tcpSegmentLength = ipTotalLength - ipHeaderLength;
+
+    if (tcpSegmentLength < tcpHeaderLength)
+        return;
+
+    payloadLength = tcpSegmentLength - tcpHeaderLength;
+
+    if (payloadLength == 0)
+        return;
+
+    payload = (uint8_t*) tcp + tcpHeaderLength;
+    packetType = payload[0] & 0xF0;
+
+    // CONNACK
+    if (packetType == 0x20)
+    {
+        if (payloadLength >= 4 && payload[1] == 0x02)
+        {
+            returnCode = payload[3];
+
+            if (returnCode == 0x00)
+            {
+                mqttConnected = true;
+                putsUart0("MQTT CONNACK accepted\r\n");
+            }
+            else
+            {
+                mqttConnected = false;
+                putsUart0("MQTT CONNACK rejected\r\n");
+            }
+        }
+    }
+    // SUBACK
+    else if (packetType == 0x90)
+    {
+        putsUart0("MQTT SUBACK received\r\n");
+    }
+    // UNSUBACK
+    else if (packetType == 0xB0)
+    {
+        putsUart0("MQTT UNSUBACK received\r\n");
+    }
+    // PUBLISH from broker
+    else if (packetType == 0x30)
+    {
+        if (payloadLength < 4)
+            return;
+
+        topicLength = ((uint16_t)payload[2] << 8) | payload[3];
+        topicIndex = 4;
+
+        if ((topicIndex + topicLength) > payloadLength)
+            return;
+
+        if (topicLength >= sizeof(topic))
+            topicLength = sizeof(topic) - 1;
+
+        for (i = 0; i < topicLength; i++)
+            topic[i] = payload[topicIndex + i];
+        topic[topicLength] = '\0';
+
+        dataIndex = 4 + (((uint16_t)payload[2] << 8) | payload[3]);
+        if (dataIndex > payloadLength)
+            return;
+
+        dataLength = payloadLength - dataIndex;
+        if (dataLength >= sizeof(msg))
+            dataLength = sizeof(msg) - 1;
+
+        for (i = 0; i < dataLength; i++)
+            msg[i] = payload[dataIndex + i];
+        msg[dataLength] = '\0';
+
+        putsUart0("MQTT PUBLISH received\r\n");
+        putsUart0("  topic: ");
+        putsUart0(topic);
+        putsUart0("\r\n");
+        putsUart0("  data: ");
+        putsUart0(msg);
+        putsUart0("\r\n");
+    }
+}
+
+
 // ------------------------------------------------------------------------------
 // Public functions
 // ------------------------------------------------------------------------------
 
 void connectMqtt()
 {
+    uint8_t brokerIp[4];
+
+    getIpMqttBrokerAddress(brokerIp);
+
     mqttConnectRequested = true;
     mqttConnectSent = false;
     mqttConnected = false;
 
     if (mqttSocket == 0)
-    {
-        mqttSocket = tcpConnect(mqttBrokerIp, mqttBrokerPort, mqttLocalPort);
-    }
+        mqttSocket = tcpConnect(brokerIp, mqttBrokerPort, mqttLocalPort);
 
     if (mqttSocket != 0)
         putsUart0("MQTT TCP connect requested\r\n");
@@ -131,22 +251,43 @@ void connectMqtt()
 
 void disconnectMqtt()
 {
-    if (mqttSocket != 0)
+    if (mqttSocket == 0)
     {
-        mqttSendSimplePacket(0xE0);   // DISCONNECT
-        tcpClose(mqttSocket);
-        mqttSocket = 0;
+        putsUart0("MQTT not connected\r\n");
+        return;
     }
 
-    mqttConnectRequested = false;
-    mqttConnectSent = false;
-    mqttConnected = false;
-
-    putsUart0("MQTT disconnect requested\r\n");
+    if (tcpIsConnected(mqttSocket))
+    {
+        mqttSendSimplePacket(0xE0);   // MQTT DISCONNECT
+        tcpClose(mqttSocket);         // queue TCP FIN
+        putsUart0("MQTT disconnect requested\r\n");
+    }
+    else
+    {
+        mqttSocket = 0;
+        mqttConnectRequested = false;
+        mqttConnectSent = false;
+        mqttConnected = false;
+        putsUart0("MQTT socket cleared\r\n");
+    }
 }
 
 void processMqttConnection()
 {
+    if (mqttSocket != 0)
+    {
+        if (mqttSocket->state == TCP_CLOSED || mqttSocket->state == TCP_TIME_WAIT)
+        {
+            mqttSocket = 0;
+            mqttConnectRequested = false;
+            mqttConnectSent = false;
+            mqttConnected = false;
+            putsUart0("MQTT socket closed\r\n");
+            return;
+        }
+    }
+
     if (!mqttConnectRequested)
         return;
 
@@ -172,8 +313,11 @@ void publishMqtt(char strTopic[], char strData[])
     uint16_t remainingLength;
     uint16_t rlBytes;
 
-    if (mqttSocket == 0)
+    if (mqttSocket == 0 || !mqttConnected || !tcpIsConnected(mqttSocket))
+    {
+        putsUart0("MQTT not connected\r\n");
         return;
+    }
 
     topicLen = strlen(strTopic);
     dataLen = strlen(strData);
@@ -202,8 +346,11 @@ void subscribeMqtt(char strTopic[])
     uint16_t rlBytes;
     static uint16_t packetId = 1;
 
-    if (mqttSocket == 0)
+    if (mqttSocket == 0 || !mqttConnected || !tcpIsConnected(mqttSocket))
+    {
+        putsUart0("MQTT not connected\r\n");
         return;
+    }
 
     topicLen = strlen(strTopic);
 
@@ -234,8 +381,11 @@ void unsubscribeMqtt(char strTopic[])
     uint16_t rlBytes;
     static uint16_t packetId = 100;
 
-    if (mqttSocket == 0)
+    if (mqttSocket == 0 || !mqttConnected || !tcpIsConnected(mqttSocket))
+    {
+        putsUart0("MQTT not connected\r\n");
         return;
+    }
 
     topicLen = strlen(strTopic);
 
