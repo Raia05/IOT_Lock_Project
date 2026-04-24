@@ -22,7 +22,12 @@ static bool mqttConnected = false;
 
 static uint16_t mqttBrokerPort = 1883;
 static uint16_t mqttLocalPort = 50001;
-static char mqttClientId[] = "tm4cClient";
+static char mqttClientId[] = "lock";
+
+static uint32_t mqttPingTimer = 0;
+static bool mqttPingWaiting = false;
+#define MQTT_KEEPALIVE_SECONDS 60
+#define MQTT_PING_INTERVAL_SECONDS 30
 
 // ------------------------------------------------------------------------------
 // Local helpers
@@ -107,6 +112,31 @@ static bool mqttSendConnectPacket(void)
     return tcpSend(mqttSocket, packet, i);
 }
 
+void callbackMqttPingTimer(void)
+{
+    mqttPingTimer++;
+}
+
+void processMqttKeepAlive(void)
+{
+    if (mqttSocket == 0)
+        return;
+
+    if (!mqttConnected)
+        return;
+
+    if (!tcpIsConnected(mqttSocket))
+        return;
+
+    if (mqttPingTimer >= MQTT_PING_INTERVAL_SECONDS)
+    {
+        mqttSendSimplePacket(0xC0);   // PINGREQ
+        mqttPingTimer = 0;
+        mqttPingWaiting = true;
+        //putsUart0("MQTT PINGREQ sent\r\n");
+    }
+}
+
 void processMqttResponse(etherHeader *ether)
 {
     ipHeader *ip;
@@ -120,6 +150,7 @@ void processMqttResponse(etherHeader *ether)
     uint8_t packetType;
     uint8_t returnCode;
     uint16_t topicLength;
+    uint16_t originalTopicLength;
     uint16_t topicIndex;
     uint16_t dataIndex;
     uint16_t dataLength;
@@ -155,6 +186,9 @@ void processMqttResponse(etherHeader *ether)
     payload = (uint8_t*) tcp + tcpHeaderLength;
     packetType = payload[0] & 0xF0;
 
+    // Any valid MQTT packet from broker means connection is alive
+    mqttPingTimer = 0;
+
     // CONNACK
     if (packetType == 0x20)
     {
@@ -165,6 +199,11 @@ void processMqttResponse(etherHeader *ether)
             if (returnCode == 0x00)
             {
                 mqttConnected = true;
+                mqttPingWaiting = false;
+                mqttPingTimer = 0;
+
+                startPeriodicTimer(callbackMqttPingTimer, 1);
+
                 putsUart0("MQTT CONNACK accepted\r\n");
             }
             else
@@ -173,6 +212,12 @@ void processMqttResponse(etherHeader *ether)
                 putsUart0("MQTT CONNACK rejected\r\n");
             }
         }
+    }
+    // PINGRESP
+    else if (packetType == 0xD0)
+    {
+        mqttPingWaiting = false;
+        //putsUart0("MQTT PINGRESP received\r\n");
     }
     // SUBACK
     else if (packetType == 0x90)
@@ -184,16 +229,17 @@ void processMqttResponse(etherHeader *ether)
     {
         putsUart0("MQTT UNSUBACK received\r\n");
     }
-    // PUBLISH from broker
+    // PUBLISH from broker, QoS 0 only
     else if (packetType == 0x30)
     {
         if (payloadLength < 4)
             return;
 
-        topicLength = ((uint16_t)payload[2] << 8) | payload[3];
+        originalTopicLength = ((uint16_t)payload[2] << 8) | payload[3];
+        topicLength = originalTopicLength;
         topicIndex = 4;
 
-        if ((topicIndex + topicLength) > payloadLength)
+        if ((topicIndex + originalTopicLength) > payloadLength)
             return;
 
         if (topicLength >= sizeof(topic))
@@ -203,11 +249,13 @@ void processMqttResponse(etherHeader *ether)
             topic[i] = payload[topicIndex + i];
         topic[topicLength] = '\0';
 
-        dataIndex = 4 + (((uint16_t)payload[2] << 8) | payload[3]);
+        dataIndex = 4 + originalTopicLength;
+
         if (dataIndex > payloadLength)
             return;
 
         dataLength = payloadLength - dataIndex;
+
         if (dataLength >= sizeof(msg))
             dataLength = sizeof(msg) - 1;
 
@@ -333,8 +381,11 @@ void publishMqtt(char strTopic[], char strData[])
     memcpy(&packet[i], strData, dataLen);
     i += dataLen;
 
-    tcpSend(mqttSocket, packet, i);
-    putsUart0("MQTT PUBLISH sent\r\n");
+    if (tcpSend(mqttSocket, packet, i))
+    {
+        mqttPingTimer = 0;
+        putsUart0("MQTT PUBLISH sent\r\n");
+    }
 }
 
 void subscribeMqtt(char strTopic[])
@@ -368,8 +419,11 @@ void subscribeMqtt(char strTopic[])
 
     packetId++;
 
-    tcpSend(mqttSocket, packet, i);
-    putsUart0("MQTT SUBSCRIBE sent\r\n");
+    if (tcpSend(mqttSocket, packet, i))
+    {
+        mqttPingTimer = 0;
+        putsUart0("MQTT SUBSCRIBE sent\r\n");
+    }
 }
 
 void unsubscribeMqtt(char strTopic[])
@@ -402,6 +456,9 @@ void unsubscribeMqtt(char strTopic[])
 
     packetId++;
 
-    tcpSend(mqttSocket, packet, i);
-    putsUart0("MQTT UNSUBSCRIBE sent\r\n");
+    if (tcpSend(mqttSocket, packet, i))
+    {
+        mqttPingTimer = 0;
+        putsUart0("MQTT UNSUBSCRIBE sent\r\n");
+    }
 }

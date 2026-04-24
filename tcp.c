@@ -500,7 +500,7 @@ void processTcpResponse(etherHeader *ether)
     if (!isTcp(ether))
         return;
 
-    putsUart0("TCP RX\r\n");
+    //putsUart0("TCP RX\r\n");
 
     s = findSocketByTuple(ether);
     if (s == NULL)

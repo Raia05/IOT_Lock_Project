@@ -526,6 +526,7 @@ int main(void)
         sendTcpPendingMessages(data);
 
         processMqttConnection();
+        processMqttKeepAlive();
 
         // Packet processing
         if (isEtherDataAvailable())
