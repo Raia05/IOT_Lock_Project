@@ -76,6 +76,7 @@
 #include "tcp.h"
 #include "dhcp.h"
 #include "mqtt.h"
+#include "lock.h"
 
 // Pins
 #define RED_LED PORTF,1
@@ -449,6 +450,35 @@ void processShell()
                 }
             }
 
+            if (strcmp(token, "lock") == 0)
+            {
+                token = strtok(NULL, " ");
+
+                if (token != NULL)
+                {
+                    if (strcmp(token, "state") == 0)
+                    {
+                        publishLockState();
+                    }
+                    else if (strcmp(token, "lock") == 0)
+                    {
+                        lockSetState("lock");
+                    }
+                    else if (strcmp(token, "unlock") == 0)
+                    {
+                        lockSetState("unlock");
+                    }
+                    else
+                    {
+                        putsUart0("Invalid lock command\r\n");
+                    }
+                }
+                else
+                {
+                    putsUart0("Usage: lock state | lock lock | lock unlock\r\n");
+                }
+            }
+
             if (strcmp(token, "help") == 0)
             {
                 putsUart0("Commands:\n\r");
@@ -483,6 +513,9 @@ int main(void)
 
     // Init controller
     initHw();
+
+    //Init lock
+    initLock();
 
     // Setup UART0
     initUart0();
@@ -527,6 +560,9 @@ int main(void)
 
         processMqttConnection();
         processMqttKeepAlive();
+
+        //will change the lock based on the state
+        serviceLockButton();
 
         // Packet processing
         if (isEtherDataAvailable())

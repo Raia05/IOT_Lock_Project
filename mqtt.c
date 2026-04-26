@@ -10,6 +10,7 @@
 #include "ip.h"
 #include "uart0.h"
 #include "timer.h"
+#include "lock.h"
 
 // ------------------------------------------------------------------------------
 // Globals
@@ -270,6 +271,11 @@ void processMqttResponse(etherHeader *ether)
         putsUart0("  data: ");
         putsUart0(msg);
         putsUart0("\r\n");
+
+        if (strcmp(topic, "lock_set_state") == 0)
+        {
+            lockSetState(msg);
+        }
     }
 }
 
